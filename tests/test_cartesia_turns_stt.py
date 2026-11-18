@@ -4,13 +4,16 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-from unittest.mock import AsyncMock
+import json
+from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from websockets.protocol import State
 
-from pipecat.frames.frames import EagerTranscriptionFrame
+from pipecat.frames.frames import EagerTranscriptionFrame, TranscriptionFrame
 from pipecat.services.cartesia.turns.stt import CartesiaTurnsSTTService
+from pipecat.transcriptions.language import Language
 from pipecat.turns.user_turn_strategies import (
     EagerUserTurnStrategies,
     ExternalUserTurnStrategies,
@@ -89,6 +92,125 @@ def test_cartesia_turns_websocket_url_clamps_keyterms_to_limits():
     query = parse_qs(urlparse(service._websocket_url()).query)
 
     assert query["keyterm"] == [f"term{i}" for i in range(100)]
+
+
+def test_cartesia_turns_websocket_url_includes_language_hints_as_base_codes():
+    service = _service(
+        settings=CartesiaTurnsSTTService.Settings(
+            language_hints=[Language.HI, Language.EN_US, Language.EN, Language.PT_BR]
+        )
+    )
+
+    query = parse_qs(urlparse(service._websocket_url()).query)
+
+    assert query["language_hint"] == ["hi", "en", "pt"]
+
+
+@pytest.mark.parametrize("language_hints", [None, []])
+def test_cartesia_turns_websocket_url_omits_language_hints_when_not_set(language_hints):
+    service = _service(settings=CartesiaTurnsSTTService.Settings(language_hints=language_hints))
+
+    query = parse_qs(urlparse(service._websocket_url()).query)
+
+    assert "language_hint" not in query
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "language_hints, sent",
+    [([Language.ES, Language.EN_GB], ["es", "en"]), ([], []), (None, [])],
+)
+async def test_cartesia_turns_update_language_hints_sends_config(monkeypatch, language_hints, sent):
+    service = _service(settings=CartesiaTurnsSTTService.Settings(language_hints=[Language.HI]))
+    service._websocket = MagicMock(state=State.OPEN, send=AsyncMock())
+    reconnect = AsyncMock()
+    monkeypatch.setattr(service, "_request_reconnect", reconnect)
+
+    await service._update_settings(CartesiaTurnsSTTService.Settings(language_hints=language_hints))
+
+    service._websocket.send.assert_awaited_once()
+    assert json.loads(service._websocket.send.await_args.args[0]) == {
+        "type": "config",
+        "language_hints": sent,
+    }
+    reconnect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cartesia_turns_update_language_hints_without_a_connection_waits_for_the_url():
+    service = _service()
+
+    await service._update_settings(CartesiaTurnsSTTService.Settings(language_hints=[Language.JA]))
+
+    query = parse_qs(urlparse(service._websocket_url()).query)
+    assert query["language_hint"] == ["ja"]
+
+
+@pytest.mark.asyncio
+async def test_cartesia_turns_update_with_a_reconnect_carries_language_hints_in_the_url(
+    monkeypatch,
+):
+    service = _service()
+    service._websocket = MagicMock(state=State.OPEN, send=AsyncMock())
+    reconnect = AsyncMock()
+    monkeypatch.setattr(service, "_request_reconnect", reconnect)
+
+    await service._update_settings(
+        CartesiaTurnsSTTService.Settings(keyterm=["Cartesia"], language_hints=[Language.FR])
+    )
+
+    reconnect.assert_awaited_once()
+    service._websocket.send.assert_not_awaited()
+    assert parse_qs(urlparse(service._websocket_url()).query)["language_hint"] == ["fr"]
+
+
+@pytest.mark.parametrize(
+    "language_hints, expected",
+    [(None, Language.EN), ([Language.HI, Language.EN], Language.HI)],
+)
+def test_cartesia_turns_labels_transcripts_with_the_first_hint_until_detection(
+    language_hints, expected
+):
+    service = _service(settings=CartesiaTurnsSTTService.Settings(language_hints=language_hints))
+
+    assert service._language == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "languages, expected",
+    [
+        ([{"language": "es", "confidence": 0.8}, {"language": "en", "confidence": 0.2}], "es"),
+        ([{"language": "yue", "confidence": 0.9}], "yue"),
+        ([], "hi"),
+        (None, "hi"),
+        ([{"language": "not-a-language", "confidence": 0.9}], "hi"),
+    ],
+    ids=["strongest", "three-letter-code", "empty", "absent", "unknown"],
+)
+async def test_cartesia_turns_labels_transcripts_with_the_detected_language(languages, expected):
+    service = _service(settings=CartesiaTurnsSTTService.Settings(language_hints=[Language.HI]))
+    service.push_frame = AsyncMock()
+    service.broadcast_frame = AsyncMock()
+
+    await service._handle_turn_end({"transcript": "hola", "languages": languages})
+
+    frames = [call.args[0] for call in service.push_frame.await_args_list]
+    transcription = next(f for f in frames if isinstance(f, TranscriptionFrame))
+    assert transcription.language == Language(expected)
+
+
+@pytest.mark.asyncio
+async def test_cartesia_turns_eager_end_labels_the_transcript_with_the_detected_language():
+    service = _service(enable_eager_end_of_turn=True)
+    service.push_frame = AsyncMock()
+
+    await service._handle_turn_eager_end(
+        {"transcript": "bonjour", "languages": [{"language": "fr", "confidence": 0.9}]}
+    )
+
+    (frame,) = [call.args[0] for call in service.push_frame.await_args_list]
+    assert frame.language == Language.FR
 
 
 @pytest.mark.asyncio
